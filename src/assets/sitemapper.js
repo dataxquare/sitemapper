@@ -7,9 +7,8 @@
  */
 
 import { XMLParser } from 'fast-xml-parser';
-import got from 'got';
+import got_default from 'got';
 import zlib from 'zlib';
-import pLimit from 'p-limit';
 import isGzip from 'is-gzip';
 
 /**
@@ -23,12 +22,14 @@ export default class Sitemapper {
    * @params {string} [options.url] - the Sitemap url (e.g https://wp.seantburke.com/sitemap.xml)
    * @params {Timeout} [options.timeout] - @see {timeout}
    * @params {boolean} [options.debug] - Enables/Disables additional logging
-   * @params {integer} [options.concurrency] - The number of concurrent sitemaps to crawl (e.g. 2 will crawl no more than 2 sitemaps at the same time)
    * @params {integer} [options.retries] - The maximum number of retries to attempt when crawling fails (e.g. 1 for 1 retry, 2 attempts in total)
    * @params {boolean} [options.rejectUnauthorized] - If true (default), it will throw on invalid certificates, such as expired or self-signed ones.
    * @params {lastmod} [options.lastmod] - the minimum lastmod value for urls
    * @params {hpagent.HttpProxyAgent|hpagent.HttpsProxyAgent} [options.proxyAgent] - instance of npm "hpagent" HttpProxyAgent or HttpsProxyAgent to be passed to npm "got"
    * @params {Array<RegExp>} [options.exclusions] - Array of regex patterns to exclude URLs
+   * @params {Array<RegExp>} [options.includes] - Array of regex patterns to INCLUDE URLs. Only URLs matching one of these patterns will be kept.
+   * @params {number} [options.limit] - The maximum number of URLs to extract from the sitemap(s). Extraction stops once this limit is reached.
+   * @params {Object} [options.requestClient] - An optional custom 'got' instance to use for HTTP requests. Useful for testing or custom configurations.
    *
    * @example let sitemap = new Sitemapper({
    *   url: 'https://wp.seantburke.com/sitemap.xml',
@@ -45,13 +46,183 @@ export default class Sitemapper {
     this.lastmod = settings.lastmod || 0;
     this.requestHeaders = settings.requestHeaders;
     this.debug = settings.debug;
-    this.concurrency = settings.concurrency || 10;
     this.retries = settings.retries || 0;
     this.rejectUnauthorized =
       settings.rejectUnauthorized === false ? false : true;
     this.fields = settings.fields || false;
     this.proxyAgent = settings.proxyAgent || {};
     this.exclusions = settings.exclusions || [];
+    this.includes = settings.includes || [];
+    this.limit = settings.limit || 1000;
+    this.requestClient = settings.requestClient || got_default;
+    this.uniqueSites = new Set();
+  }
+
+    /**
+   * Fetches the robots.txt file, extracts sitemap URLs, and then crawls those sitemaps.
+   *
+   * @public
+   * @param {string} [robotsTxtUrl] - The URL of the robots.txt file (e.g., 'https://example.com/robots.txt').
+   * If not provided, it will attempt to construct it from the base URL.
+   * @returns {Promise<RobotsData>}
+   * @example
+   * let sitemap = new Sitemapper({ limit: 50 });
+   * sitemap.fetchRobots('https://www.weforum.org/robots.txt')
+   * .then(data => {
+   * console.log('Sitemaps found in robots.txt:', data.sitemaps.length);
+   * console.log('URLs collected from sitemaps:', data.sites.length);
+   * });
+   */
+  async fetchRobots(robotsTxtUrl = null) {
+    this.uniqueSites = new Set();
+
+    const baseUrl = robotsTxtUrl
+      ? robotsTxtUrl.substring(0, robotsTxtUrl.lastIndexOf('/') + 1)
+      : this.url.substring(0, this.url.lastIndexOf('/') + 1);
+
+    const actualRobotsTxtUrl = robotsTxtUrl || `${baseUrl}robots.txt`;
+
+    let robotsResults = {
+      url: actualRobotsTxtUrl,
+      sitemaps: [],
+      sites: [],
+      errors: [],
+    };
+
+    if (this.debug) {
+      console.debug(`Fetching robots.txt from: ${actualRobotsTxtUrl}`);
+      if (this.limit !== Infinity) {
+        console.debug(`Limiting total URLs extracted to ${this.limit}`);
+      }
+    }
+
+    try {
+      const { error, data: robotsTxtContent, type } = await this.parseRobots(actualRobotsTxtUrl);
+
+      if (error) {
+        robotsResults.errors.push({
+          type: type || 'RobotsParseError',
+          message: error,
+          url: actualRobotsTxtUrl,
+          retries: 0,
+        });
+        if (this.debug) {
+          console.error(`Error parsing robots.txt: ${error}`);
+        }
+      } else {
+        const sitemapUrls = this.extractSitemapsFromRobots(robotsTxtContent);
+        robotsResults.sitemaps = sitemapUrls;
+
+        if (this.debug) {
+          console.debug(`Found ${sitemapUrls.length} sitemaps in robots.txt.`);
+          sitemapUrls.forEach(sUrl => console.debug(`  - ${sUrl}`));
+        }
+
+        for (const sitemapUrl of sitemapUrls) {
+          if (this.uniqueSites.size >= this.limit) {
+            if (this.debug) {
+              console.debug(`Limit of ${this.limit} reached. Stopping further sitemap crawls from robots.txt.`);
+            }
+            break;
+          }
+
+          if (this.debug) {
+              console.debug(`Crawling sitemap from robots.txt: ${sitemapUrl}`);
+          }
+          const { sites: crawledSites, errors: crawledErrors } = await this.crawl(sitemapUrl, 0, this.uniqueSites);
+          
+          robotsResults.errors.push(...crawledErrors);
+        }
+      }
+    } catch (e) {
+      robotsResults.errors.push({
+        type: 'GeneralRobotsError',
+        message: e.message,
+        url: actualRobotsTxtUrl,
+        retries: 0,
+      });
+      if (this.debug) {
+        console.error(`Unhandled error in fetchRobots: ${e}`);
+      }
+    }
+
+    const finalSites = Array.from(this.uniqueSites).slice(0, this.limit);
+    robotsResults.sites = finalSites;
+
+    return robotsResults;
+  }
+
+  /**
+   * Fetches and parses a robots.txt file.
+   *
+   * @private
+   * @param {string} url - The URL of the robots.txt file.
+   * @returns {Promise<ParseData>} Returns content in data.
+   */
+  async parseRobots(url) {
+    const requestOptions = {
+      method: 'GET',
+      resolveWithFullResponse: true,
+      headers: this.requestHeaders,
+      https: {
+        rejectUnauthorized: this.rejectUnauthorized,
+      },
+      agent: this.proxyAgent,
+    };
+
+    try {
+      const requester = this.requestClient.get(url, requestOptions);
+      this.initializeTimeout(url, requester);
+      const response = await requester;
+
+      if (!response || response.statusCode !== 200) {
+        clearTimeout(this.timeoutTable[url]);
+        return { error: response.error, data: response, type: 'HTTPError' };
+      }
+
+      return { error: null, data: response.body, type: 'Success' };
+    } catch (error) {
+      if (error.name === 'CancelError') {
+        return {
+          error: `Request timed out after ${this.timeout} milliseconds for url: '${url}'`,
+          data: error,
+          type: 'CancelError'
+        };
+      }
+      if (error.name === 'HTTPError') {
+        return {
+          error: `HTTP Error occurred: ${error.message}`,
+          data: error,
+          type: 'HTTPError'
+        };
+      }
+      return {
+        error: `Error occurred: ${error.name}`,
+        data: error,
+        type: error.name
+      };
+    }
+  }
+
+  /**
+   * Extracts Sitemap URLs from robots.txt content.
+   *
+   * @private
+   * @param {string} robotsTxtContent - The content of the robots.txt file.
+   * @returns {string[]} An array of sitemap URLs found.
+   */
+  extractSitemapsFromRobots(robotsTxtContent) {
+    const sitemapUrls = [];
+    const lines = robotsTxtContent.split('\n');
+    const sitemapRegex = /^Sitemap:\s*(.*)/i;
+
+    for (const line of lines) {
+      const match = line.match(sitemapRegex);
+      if (match && match[1]) {
+        sitemapUrls.push(match[1].trim());
+      }
+    }
+    return sitemapUrls;
   }
 
   /**
@@ -61,37 +232,40 @@ export default class Sitemapper {
    * @param {string} [url] - the Sitemaps url (e.g https://wp.seantburke.com/sitemap.xml)
    * @returns {Promise<SitesData>}
    * @example sitemapper.fetch('example.xml')
-   *  .then((sites) => console.log(sites));
+   * .then((sites) => console.log(sites));
    */
   async fetch(url = this.url) {
-    // initialize empty variables
+    // Reset uniqueSites for each new fetch operation
+    this.uniqueSites = new Set();
+
     let results = {
       url: '',
       sites: [],
       errors: [],
     };
 
-    // attempt to set the variables with the crawl
     if (this.debug) {
-      // only show if it's set
       if (this.lastmod) {
         console.debug(`Using minimum lastmod value of ${this.lastmod}`);
+      }
+      if (this.limit !== Infinity) {
+        console.debug(`Limiting total URLs extracted to ${this.limit}`);
       }
     }
 
     try {
-      // crawl the URL
-      results = await this.crawl(url);
+      results = await this.crawl(url, 0, this.uniqueSites);
     } catch (e) {
-      // show errors that may occur
       if (this.debug) {
         console.error(e);
       }
     }
 
+    const finalSites = Array.from(results.sites).slice(0, this.limit);
+
     return {
       url,
-      sites: results.sites || [],
+      sites: finalSites || [],
       errors: results.errors || [],
     };
   }
@@ -197,7 +371,7 @@ export default class Sitemapper {
 
     try {
       // create a request Promise with the url and request options
-      const requester = got.get(url, requestOptions);
+      const requester = this.requestClient.get(url, requestOptions);
 
       // initialize the timeout method based on the URL, and pass the request object.
       this.initializeTimeout(url, requester);
@@ -208,7 +382,7 @@ export default class Sitemapper {
       // if the response does not have a successful status code then clear the timeout for this url.
       if (!response || response.statusCode !== 200) {
         clearTimeout(this.timeoutTable[url]);
-        return { error: response.error, data: response };
+        return { error: response.error, data: response, type: 'HTTPError' };
       }
 
       let responseBody;
@@ -227,15 +401,14 @@ export default class Sitemapper {
       });
 
       const data = parser.parse(responseBody.toString());
-
-      // return the results
-      return { error: null, data };
+      return { error: null, data, type: 'Success' };
     } catch (error) {
       // If the request was canceled notify the user of the timeout
       if (error.name === 'CancelError') {
         return {
           error: `Request timed out after ${this.timeout} milliseconds for url: '${url}'`,
           data: error,
+          type: 'CancelError',
         };
       }
 
@@ -244,6 +417,7 @@ export default class Sitemapper {
         return {
           error: `HTTP Error occurred: ${error.message}`,
           data: error,
+          type: 'HTTPError',
         };
       }
 
@@ -251,6 +425,7 @@ export default class Sitemapper {
       return {
         error: `Error occurred: ${error.name}`,
         data: error,
+        type: error.name,
       };
     }
   }
@@ -274,17 +449,24 @@ export default class Sitemapper {
    * @private
    * @param {string} url - the Sitemaps url (e.g https://wp.seantburke.com/sitemap.xml)
    * @param {integer} retryIndex - number of retry attempts fro this URL (e.g. 0 for 1st attempt, 1 for second attempty etc.)
+   * @param {Set<string>} [uniqueSites] - A Set accumulating the unique sites found so far across recursive calls.
    * @returns {Promise<SitesData>}
    */
-  async crawl(url, retryIndex = 0) {
+  async crawl(url, retryIndex = 0, uniqueSites = new Set()) {
     try {
-      const { error, data } = await this.parse(url);
-      // The promise resolved, remove the timeout
+      if (uniqueSites.size >= this.limit) {
+        if (this.debug) {
+          console.debug(
+            `Limit of ${this.limit} reached. Stopping crawl for ${url}. Current unique sites count: ${uniqueSites.size}`
+          );
+        }
+        return { sites: uniqueSites, errors: [] };
+      }
+
+      const { error, data, type } = await this.parse(url);
       clearTimeout(this.timeoutTable[url]);
 
       if (error) {
-        // Handle errors during sitemap parsing / request
-        // Retry on error until you reach the retry limit set in the settings
         if (retryIndex < this.retries) {
           if (this.debug) {
             console.log(
@@ -293,7 +475,7 @@ export default class Sitemapper {
               }) ${url} due to ${data.name} on previous request`
             );
           }
-          return this.crawl(url, retryIndex + 1);
+          return this.crawl(url, retryIndex + 1, uniqueSites);
         }
 
         if (this.debug) {
@@ -302,12 +484,11 @@ export default class Sitemapper {
           );
         }
 
-        // Fail and log error
         return {
-          sites: [],
+          sites: uniqueSites,
           errors: [
             {
-              type: data.name,
+              type: type || data.name,
               message: error,
               url,
               retries: retryIndex,
@@ -315,24 +496,24 @@ export default class Sitemapper {
           ],
         };
       } else if (data && data.urlset && data.urlset.url) {
-        // Handle URLs found inside the sitemap
         if (this.debug) {
           console.debug(`Urlset found during "crawl('${url}')"`);
         }
 
-        // Convert single object to array if needed
         const urlArray = Array.isArray(data.urlset.url)
           ? data.urlset.url
           : [data.urlset.url];
 
-        // Begin filtering the urls
-        const sites = urlArray
+        const newSites = urlArray
           .filter((site) => {
             if (this.lastmod === 0) return true;
             if (site.lastmod === undefined) return false;
             const modified = new Date(site.lastmod).getTime();
 
             return modified >= this.lastmod;
+          })
+          .filter((site) => {
+            return this.isIncluded(site.loc);
           })
           .filter((site) => {
             return !this.isExcluded(site.loc);
@@ -354,8 +535,28 @@ export default class Sitemapper {
             }
           });
 
+        for (const site of newSites) {
+          if (uniqueSites.size < this.limit) {
+            // Only add if limit not reached
+            uniqueSites.add(site);
+          } else {
+            if (this.debug) {
+              console.debug(
+                `Limit of ${this.limit} reached while adding sites from ${url}. Stopping further additions from this urlset.`
+              );
+            }
+            break;
+          }
+        }
+
+        if (this.debug) {
+          console.debug(
+            `Added ${newSites.length} potential sites from ${url}. Current unique total: ${uniqueSites.size}`
+          );
+        }
+
         return {
-          sites,
+          sites: uniqueSites,
           errors: [],
         };
       } else if (data && data.sitemapindex) {
@@ -364,34 +565,45 @@ export default class Sitemapper {
           console.debug(`Additional sitemap found during "crawl('${url}')"`);
         }
         // Map each child url into a promise to create an array of promises
-        const sitemap = data.sitemapindex.sitemap
+        const sitemapUrlsToCrawl = data.sitemapindex.sitemap
           .map((map) => map.loc)
           .filter((url) => {
             return !this.isExcluded(url);
           });
 
-        // Parse all child urls within the concurrency limit in the settings
-        const limit = pLimit(this.concurrency);
-        const promiseArray = sitemap.map((site) =>
-          limit(() => this.crawl(site))
-        );
+        let aggregatedErrors = [];
 
-        // Make sure all the promises resolve then filter and reduce the array
-        const results = await Promise.all(promiseArray);
-        const sites = results
-          .filter((result) => result.errors.length === 0)
-          .reduce((prev, { sites }) => [...prev, ...sites], []);
-        const errors = results
-          .filter((result) => result.errors.length !== 0)
-          .reduce((prev, { errors }) => [...prev, ...errors], []);
+        for (const sitemapUrl of sitemapUrlsToCrawl) {
+          if (uniqueSites.size >= this.limit) {
+            if (this.debug) {
+              console.debug(
+                `Limit of ${this.limit} reached. Stopping further sequential child sitemap crawls from ${url}. Current unique total: ${uniqueSites.size}`
+              );
+            }
+            break;
+          }
+
+          const { sites: childSites, errors: childErrors } = await this.crawl(
+            sitemapUrl,
+            0,
+            uniqueSites
+          );
+
+          aggregatedErrors.push(...childErrors);
+        }
+
+        if (this.debug) {
+          console.debug(
+            `Finished crawling child sitemaps from ${url}. Current unique total sites after aggregation: ${uniqueSites.size}`
+          );
+        }
 
         return {
-          sites,
-          errors,
+          sites: uniqueSites,
+          errors: aggregatedErrors,
         };
       }
 
-      // Retry on error until you reach the retry limit set in the settings
       if (retryIndex < this.retries) {
         if (this.debug) {
           console.log(
@@ -400,28 +612,33 @@ export default class Sitemapper {
             }) ${url} due to ${data.name} on previous request`
           );
         }
-        return this.crawl(url, retryIndex + 1);
+        return this.crawl(url, retryIndex + 1, uniqueSites);
       }
       if (this.debug) {
         console.error(`Unknown state during "crawl('${url})'":`, error, data);
       }
 
-      // Fail and log error
       return {
-        sites: [],
+        sites: uniqueSites,
         errors: [
           {
             url,
-            type: data.name || 'UnknownStateError',
-            message: 'An unknown error occurred.',
+            type: type || data.name || 'UnknownStateError',
+            message: error,
             retries: retryIndex,
           },
         ],
       };
     } catch (e) {
       if (this.debug) {
-        this.debug && console.error(e);
+        console.error(e);
       }
+      return {
+        sites: uniqueSites,
+        errors: [
+          { type: 'CrawlError', message: e.message, url, retries: retryIndex },
+        ],
+      };
     }
   }
 
@@ -479,6 +696,17 @@ export default class Sitemapper {
     if (this.exclusions.length === 0) return false;
     return this.exclusions.some((pattern) => pattern.test(url));
   }
+
+  /**
+   * Checks if a URL is included based on the inclusion patterns.
+   *
+   * @param {string} url - The URL to check.
+   * @returns {boolean} Returns true if the URL matches any inclusion pattern, false otherwise.
+   */
+  isIncluded(url) {
+    if (this.includes.length === 0) return true;
+    return this.includes.some((pattern) => pattern.test(url));
+  }
 }
 
 /**
@@ -510,6 +738,7 @@ export default class Sitemapper {
  * @property {string} data.urlset.url - single Url
  * @property {Object} data.sitemapindex - index of sitemap
  * @property {string} data.sitemapindex.sitemap - Sitemap
+ * @property {string} type - The type of result or error (e.g., 'Success', 'CancelError', 'HTTPError', 'RequestError')
  * @example {
  *   error: 'There was an error!'
  *   data: {

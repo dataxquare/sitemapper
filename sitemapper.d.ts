@@ -1,4 +1,5 @@
 import { HttpProxyAgent, HttpsProxyAgent } from 'hpagent';
+import { type Got } from 'got';
 
 export interface SitemapperSiteData {
   loc: string;
@@ -49,6 +50,9 @@ export interface SitemapperOptions {
   fields?: SitemapperFields;
   proxyAgent?: HttpProxyAgent | HttpsProxyAgent;
   exclusions?: RegExp[];
+  includes?: RegExp[];
+  limit?: number;
+  requestClient?: Got;
 }
 
 declare class Sitemapper {
