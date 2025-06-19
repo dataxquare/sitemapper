@@ -98,6 +98,10 @@ declare class Sitemapper {
     url: string | undefined,
     callback: (err: Error | null, sites: string[]) => void
   ): Promise<void>;
+
+  fetchRobots(
+    url: string | undefined
+  ): Promise<SitemapperResponse & { sitemaps: string[] }>;
 }
 
 export default Sitemapper;
