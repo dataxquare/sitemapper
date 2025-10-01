@@ -54,7 +54,9 @@ export default class Sitemapper {
     this.exclusions = settings.exclusions || [];
     this.includes = settings.includes || [];
     this.limit = settings.limit || 1000;
-    this.requestClient = settings.requestClient || got_default;
+    this.requestClient =
+      settings.requestClient ||
+      got_default.extend(settings.extendOptions || {});
     this.uniqueSites = new Set();
   }
 
